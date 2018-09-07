@@ -4,8 +4,14 @@ import (
 	"compress/gzip"
 	"flag"
 	"fmt"
+	"github.com/golang/protobuf/proto"
 	"io/ioutil"
+	"log"
+	"memc_load2/appsinstalled"
 	"os"
+	"reflect"
+	"strconv"
+	"strings"
 )
 
 var options struct {
@@ -39,6 +45,59 @@ func ReadGzFile(filename string) ([]byte, error) {
 
 }
 
+func protoTest() {
+	sample := "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
+	lines := strings.Split(sample, "\n")
+	for _, line := range lines {
+		var apps []uint32
+
+		apps_info := strings.Split(line, "\t")
+		raw_apps := strings.Split(apps_info[4], ",")
+
+		for _, app_id := range raw_apps {
+			id, err := strconv.ParseInt(app_id, 10, 32)
+			if err != nil {
+				log.Printf("App id: %s is not an int \n", app_id)
+				continue
+			}
+			apps = append(apps, uint32(id))
+		}
+
+		lat, err := strconv.ParseFloat(apps_info[2], 32)
+		if err != nil {
+			log.Println("Can not convert latitude to float")
+		}
+
+		lon, err := strconv.ParseFloat(apps_info[3], 32)
+		if err != nil {
+			log.Println("Can not convert longitute to float")
+		}
+
+		msg := &appsinstalled.UserApps{
+			Apps: apps,
+			Lat:  &lat,
+			Lon:  &lon,
+		}
+		encoded_msg, err := proto.Marshal(msg)
+		if err != nil {
+			log.Fatal("marshaling error: ", err)
+			return
+		}
+
+		decoded_msg := new(appsinstalled.UserApps)
+		err = proto.Unmarshal(encoded_msg, decoded_msg)
+		if err != nil {
+			log.Fatal("unmarshaling error: ", err)
+			return
+		}
+
+		if reflect.DeepEqual(msg.Apps, decoded_msg.Apps) {
+			fmt.Println("Serialization is successful!")
+		}
+
+	}
+}
+
 func main() {
 	//path := "/home/linder/PycharmProjects/otus-python/12_concurrency/medium_test_data/20170929000000.tsv.gz"
 	flag.BoolVar(&options.test, "test", false, "Test protobuf serialization/deserialization")
@@ -56,8 +115,14 @@ func main() {
 	//	log.Fatal(err)
 	//}
 	//fmt.Println(string(gzFile))
+
 	fmt.Printf("is test: %s\n", options.test)
 	fmt.Printf("is dry: %s\n", options.dryRun)
 	fmt.Printf("is pattern: %s\n", options.pattern)
 	fmt.Printf("is idfa: %s\n", options.idfa)
+
+	if options.test {
+		protoTest()
+		os.Exit(0)
+	}
 }
