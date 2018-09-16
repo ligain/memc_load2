@@ -24,6 +24,16 @@ var options struct {
 	dvid    string
 }
 
+type AppInfo struct {
+	device struct {
+		dev_type string
+		dev_id   string
+	}
+	lat  float64
+	lon  float64
+	apps []uint32
+}
+
 func ReadGzFile(filename string) ([]byte, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -125,4 +135,6 @@ func main() {
 		protoTest()
 		os.Exit(0)
 	}
+
+	//filepath.Glob("sdf")
 }
