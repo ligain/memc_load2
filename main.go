@@ -154,11 +154,6 @@ func SaveToMemc(key string, value []byte, client *memcache.Client, opt *Options,
 }
 
 func main() {
-	if options.test {
-		protoTest()
-		os.Exit(0)
-	}
-
 	rawLines := make(chan []byte)
 	deviceMap := make(map[string](chan map[string][]byte))
 	cancelCh := make(chan bool)
@@ -214,61 +209,7 @@ LOOP:
 	log.Printf("Processed lines: %d", processedItems)
 }
 
-func protoTest() {
-	sample := "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
-	lines := strings.Split(sample, "\n")
-	for _, line := range lines {
-		var apps []uint32
-
-		apps_info := strings.Split(line, "\t")
-		raw_apps := strings.Split(apps_info[4], ",")
-
-		for _, app_id := range raw_apps {
-			id, err := strconv.ParseInt(app_id, 10, 32)
-			if err != nil {
-				log.Printf("App id: %s is not an int \n", app_id)
-				continue
-			}
-			apps = append(apps, uint32(id))
-		}
-
-		lat, err := strconv.ParseFloat(apps_info[2], 32)
-		if err != nil {
-			log.Println("Can not convert latitude to float")
-		}
-
-		lon, err := strconv.ParseFloat(apps_info[3], 32)
-		if err != nil {
-			log.Println("Can not convert longitute to float")
-		}
-
-		msg := &appsinstalled.UserApps{
-			Apps: apps,
-			Lat:  &lat,
-			Lon:  &lon,
-		}
-		encoded_msg, err := proto.Marshal(msg)
-		if err != nil {
-			log.Fatal("marshaling error: ", err)
-			return
-		}
-
-		decoded_msg := new(appsinstalled.UserApps)
-		err = proto.Unmarshal(encoded_msg, decoded_msg)
-		if err != nil {
-			log.Fatal("unmarshaling error: ", err)
-			return
-		}
-
-		if reflect.DeepEqual(msg.Apps, decoded_msg.Apps) {
-			fmt.Println("Serialization is successful!")
-		}
-	}
-}
-
 func init() {
-	flag.BoolVar(&options.test, "test", false, "Test protobuf serialization/deserialization")
-	flag.BoolVar(&options.test, "t", false, "Short usage of --test option")
 	flag.BoolVar(&options.dryRun, "dry", false, "Read log files w/o writting to memcache")
 	flag.StringVar(&options.pattern, "pattern", "/data/appsinstalled/*.tsv.gz", "Path to source data")
 	flag.StringVar(&options.deviceType.idfa, "idfa", "127.0.0.1:33013", "")
