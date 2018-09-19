@@ -13,26 +13,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
-
-type Options struct {
-	test       bool
-	dryRun     bool
-	pattern    string
-	deviceType struct {
-		idfa string
-		gaid string
-		adid string
-		dvid string
-	}
-}
-
-var options Options
 
 type PreparedApps struct {
 	deviceType string
@@ -40,24 +26,27 @@ type PreparedApps struct {
 	value      []byte
 }
 
-//const NormalErrorRate = 0.01
+const NormalErrorRate = 0.01
 
 func ReadGzFile(filename string, c chan<- []byte) {
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Failed to open file: %s", filename)
+		return
 	}
 	defer file.Close()
 
 	reader, err := gzip.NewReader(file)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Can not open gzip file: %s", filename)
+		return
 	}
 	defer reader.Close()
 
 	bytesContent, err := ioutil.ReadAll(reader)
 	if err != nil {
-		log.Fatal(err)
+		log.Println("Failed to data to buf", err)
+		return
 	}
 
 	for _, byteLine := range bytes.Split(bytesContent, []byte("\n")) {
@@ -65,18 +54,15 @@ func ReadGzFile(filename string, c chan<- []byte) {
 	}
 }
 
-func initMemcConnections(opt *Options, connections map[string]*memcache.Client) {
-	val := reflect.ValueOf(opt.deviceType)
-	for i := 0; i < val.NumField(); i++ {
-		deviceType := val.Type().Field(i).Name
-		deviceHost := val.Field(i).String()
-		connections[deviceType] = memcache.New(deviceHost)
+func initMemcConnections(memc_addr map[string]*string, connections map[string]*memcache.Client) {
+	for deviceType, deviceHost := range memc_addr {
+		connections[deviceType] = memcache.New(*deviceHost)
+		connections[deviceType].Timeout = 10 * time.Second
 	}
 }
 
-func SaveToMemc(key string, value []byte, client *memcache.Client, opt *Options, errorItems *uint64, processedItems *uint64) {
-	atomic.AddUint64(processedItems, 1)
-	if !opt.dryRun {
+func SaveToMemc(key string, value []byte, client *memcache.Client, dryRun *bool, errorItems *uint64) {
+	if !*dryRun {
 		if client.Set(&memcache.Item{Key: key, Value: value}) != nil {
 			log.Printf("Error on saving item with key: %s\n", key)
 			atomic.AddUint64(errorItems, 1)
@@ -95,7 +81,6 @@ func ParseRawLine(rawLine []byte, preparedApps chan PreparedApps) {
 		return
 	}
 	line := string(rawLine)
-	fmt.Printf("Parsing line: %s\n", line)
 	apps_info := strings.Split(line, "\t")
 	raw_apps := strings.Split(apps_info[4], ",")
 
@@ -123,7 +108,7 @@ func ParseRawLine(rawLine []byte, preparedApps chan PreparedApps) {
 	}
 	encoded_msg, err := proto.Marshal(msg)
 	if err != nil {
-		log.Fatal("marshaling error: ", err)
+		log.Println("marshaling error: ", err)
 	}
 	key := apps_info[0] + apps_info[1]
 
@@ -134,24 +119,25 @@ func ParseRawLine(rawLine []byte, preparedApps chan PreparedApps) {
 }
 
 func main() {
+	memc_addr := make(map[string]*string, 4)
+	dryRun := flag.Bool("dry", false, "Read log files w/o writting to memcache")
+	pattern := flag.String("pattern", "/data/appsinstalled/*.tsv.gz", "Path to source data")
+	memc_addr["idfa"] = flag.String("idfa", "127.0.0.1:33013", "Memcached host for idfa device type")
+	memc_addr["gaid"] = flag.String("gaid", "127.0.0.1:33014", "Memcached host for gaid device type")
+	memc_addr["adid"] = flag.String("adid", "127.0.0.1:33015", "Memcached host for adid device type")
+	memc_addr["dvid"] = flag.String("dvid", "127.0.0.1:33016", "Memcached host for dvid device type")
+	flag.Parse()
+
 	rawLines := make(chan []byte)
 	preparedApps := make(chan PreparedApps)
-	deviceMap := make(map[string](chan map[string][]byte))
 	memcConnections := make(map[string]*memcache.Client, 4)
 	var wg sync.WaitGroup
-
-	//var errorItems uint64 = 0
+	var errorItems uint64 = 0
 	var processedItems uint64 = 0
 
-	val := reflect.ValueOf(options.deviceType)
-	for i := 0; i < val.NumField(); i++ {
-		deviceType := val.Type().Field(i).Name
-		deviceMap[deviceType] = make(chan map[string][]byte)
-	}
+	initMemcConnections(memc_addr, memcConnections)
 
-	initMemcConnections(&options, memcConnections)
-
-	matches, err := filepath.Glob(options.pattern)
+	matches, err := filepath.Glob(*pattern)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -163,14 +149,14 @@ func main() {
 			oldPath := path.Clean(p)
 			fmt.Println("Found file: ", oldPath)
 			ReadGzFile(oldPath, rawLines)
-			//dirpath, fpath := path.Split(oldPath)
-			//newPath := path.Join(dirpath, "."+fpath)
-			//err := os.Rename(oldPath, newPath)
-			//if err != nil {
-			//	log.Println("Can not rename file: ", err)
-			//} else {
-			//	fmt.Printf("Renamed file: %s\n", newPath)
-			//}
+			dirpath, fpath := path.Split(oldPath)
+			newPath := path.Join(dirpath, "."+fpath)
+			err := os.Rename(oldPath, newPath)
+			if err != nil {
+				log.Println("Can not rename file: ", err)
+			} else {
+				fmt.Printf("Renamed file: %s\n", newPath)
+			}
 		}
 		close(rawLines)
 	}()
@@ -185,33 +171,21 @@ func main() {
 	}()
 
 	wg.Add(1)
-	go func(processedItems *uint64) {
+	go func() {
 		defer wg.Done()
 		for pa := range preparedApps {
-			atomic.AddUint64(processedItems, 1)
-			fmt.Printf("%s chan key: %s value: %x\n", pa.deviceType, pa.key, pa.value)
+			atomic.AddUint64(&processedItems, 1)
+			SaveToMemc(pa.key, pa.value, memcConnections[pa.deviceType], dryRun, &errorItems)
 		}
-	}(&processedItems)
+	}()
 
 	wg.Wait()
+
+	errorRate := float64(errorItems) / float64(processedItems)
+	if errorRate < NormalErrorRate {
+		log.Printf("Acceptable error rate (%f). Successful load\n", errorRate)
+	} else {
+		log.Printf("High error rate (%f > %f). Failed load", errorRate, NormalErrorRate)
+	}
 	log.Printf("Processed lines: %d", processedItems)
-
-	//	errorRate := float64(errorItems) / float64(processedItems)
-	//	fmt.Printf("errorRate: %f \n", errorRate)
-	//	if errorRate < NormalErrorRate {
-	//		log.Printf("Acceptable error rate (%s). Successful load\n", errorRate)
-	//	} else {
-	//		log.Printf("High error rate (%f > %f). Failed load", errorRate, NormalErrorRate)
-	//	}
-	//	log.Printf("Processed lines: %d", processedItems)
-}
-
-func init() {
-	flag.BoolVar(&options.dryRun, "dry", false, "Read log files w/o writting to memcache")
-	flag.StringVar(&options.pattern, "pattern", "/data/appsinstalled/*.tsv.gz", "Path to source data")
-	flag.StringVar(&options.deviceType.idfa, "idfa", "127.0.0.1:33013", "")
-	flag.StringVar(&options.deviceType.gaid, "gaid", "127.0.0.1:33014", "")
-	flag.StringVar(&options.deviceType.adid, "adid", "127.0.0.1:33015", "")
-	flag.StringVar(&options.deviceType.dvid, "dvid", "127.0.0.1:33016", "")
-	flag.Parse()
 }
