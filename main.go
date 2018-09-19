@@ -14,7 +14,6 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,10 +34,15 @@ type Options struct {
 
 var options Options
 
-const NormalErrorRate = 0.01
+type PreparedApps struct {
+	deviceType string
+	key        string
+	value      []byte
+}
 
-func ReadGzFile(filename string, c chan []byte, wg *sync.WaitGroup) {
-	defer wg.Done()
+//const NormalErrorRate = 0.01
+
+func ReadGzFile(filename string, c chan<- []byte) {
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatal(err)
@@ -59,77 +63,6 @@ func ReadGzFile(filename string, c chan []byte, wg *sync.WaitGroup) {
 	for _, byteLine := range bytes.Split(bytesContent, []byte("\n")) {
 		c <- byteLine
 	}
-}
-
-func ReadGzFiles(pattern string, c chan []byte) {
-	matches, err := filepath.Glob(pattern)
-	wg := &sync.WaitGroup{}
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, p := range matches {
-		oldPath := path.Clean(p)
-		fmt.Println("Found file: ", oldPath)
-		wg.Add(1)
-		go ReadGzFile(oldPath, c, wg)
-		runtime.Gosched()
-		dirpath, fpath := path.Split(oldPath)
-		newPath := path.Join(dirpath, "."+fpath)
-		err := os.Rename(oldPath, newPath)
-		if err != nil {
-			log.Println("Can not rename file: ", err)
-		} else {
-			fmt.Printf("Renamed file: %s\n", newPath)
-		}
-	}
-	wg.Wait()
-	close(c)
-}
-
-func ParseAppsInstalled(rawLines chan []byte, deviceMap map[string](chan map[string][]byte), cancelCh chan bool) {
-	var apps []uint32
-	for rawLine := range rawLines {
-		if len(rawLine) == 0 {
-			continue
-		}
-		line := string(rawLine)
-		apps_info := strings.Split(line, "\t")
-		raw_apps := strings.Split(apps_info[4], ",")
-
-		for _, app_id := range raw_apps {
-			id, err := strconv.ParseInt(app_id, 10, 32)
-			if err != nil {
-				log.Printf("App id: %s is not an int \n", app_id)
-				continue
-			}
-			apps = append(apps, uint32(id))
-		}
-		lat, err := strconv.ParseFloat(apps_info[2], 32)
-		if err != nil {
-			log.Println("Can not convert latitude to float")
-		}
-
-		lon, err := strconv.ParseFloat(apps_info[3], 32)
-		if err != nil {
-			log.Println("Can not convert longitute to float")
-		}
-
-		msg := &appsinstalled.UserApps{
-			Apps: apps,
-			Lat:  &lat,
-			Lon:  &lon,
-		}
-		encoded_msg, err := proto.Marshal(msg)
-		if err != nil {
-			log.Fatal("marshaling error: ", err)
-			continue
-		}
-		key := apps_info[0] + apps_info[1]
-		t := make(map[string][]byte)
-		t[key] = encoded_msg
-		deviceMap[apps_info[0]] <- t
-	}
-	cancelCh <- true
 }
 
 func initMemcConnections(opt *Options, connections map[string]*memcache.Client) {
@@ -153,12 +86,61 @@ func SaveToMemc(key string, value []byte, client *memcache.Client, opt *Options,
 	log.Printf("Item with key: %s was saved to memcache\n", key)
 }
 
+func ParseRawLine(rawLine []byte, preparedApps chan PreparedApps) {
+	var apps []uint32
+	var pa PreparedApps
+
+	if len(rawLine) == 0 {
+		log.Println("Skip an empty line")
+		return
+	}
+	line := string(rawLine)
+	fmt.Printf("Parsing line: %s\n", line)
+	apps_info := strings.Split(line, "\t")
+	raw_apps := strings.Split(apps_info[4], ",")
+
+	for _, app_id := range raw_apps {
+		id, err := strconv.ParseInt(app_id, 10, 32)
+		if err != nil {
+			log.Printf("App id: %s is not an int \n", app_id)
+		}
+		apps = append(apps, uint32(id))
+	}
+	lat, err := strconv.ParseFloat(apps_info[2], 32)
+	if err != nil {
+		log.Println("Can not convert latitude to float")
+	}
+
+	lon, err := strconv.ParseFloat(apps_info[3], 32)
+	if err != nil {
+		log.Println("Can not convert longitute to float")
+	}
+
+	msg := &appsinstalled.UserApps{
+		Apps: apps,
+		Lat:  &lat,
+		Lon:  &lon,
+	}
+	encoded_msg, err := proto.Marshal(msg)
+	if err != nil {
+		log.Fatal("marshaling error: ", err)
+	}
+	key := apps_info[0] + apps_info[1]
+
+	pa.deviceType = apps_info[0]
+	pa.key = key
+	pa.value = encoded_msg
+	preparedApps <- pa
+}
+
 func main() {
 	rawLines := make(chan []byte)
+	preparedApps := make(chan PreparedApps)
 	deviceMap := make(map[string](chan map[string][]byte))
-	cancelCh := make(chan bool)
 	memcConnections := make(map[string]*memcache.Client, 4)
-	var errorItems uint64 = 0
+	var wg sync.WaitGroup
+
+	//var errorItems uint64 = 0
 	var processedItems uint64 = 0
 
 	val := reflect.ValueOf(options.deviceType)
@@ -167,46 +149,61 @@ func main() {
 		deviceMap[deviceType] = make(chan map[string][]byte)
 	}
 
-	go ReadGzFiles(options.pattern, rawLines)
-
-	for i := 0; i < 5; i++ {
-		go ParseAppsInstalled(rawLines, deviceMap, cancelCh)
-	}
-
 	initMemcConnections(&options, memcConnections)
 
-LOOP:
-	for {
-		select {
-		case m := <-deviceMap["idfa"]:
-			for k, v := range m {
-				SaveToMemc(k, v, memcConnections["idfa"], &options, &errorItems, &processedItems)
-			}
-		case m := <-deviceMap["gaid"]:
-			for k, v := range m {
-				SaveToMemc(k, v, memcConnections["gaid"], &options, &errorItems, &processedItems)
-			}
-		case m := <-deviceMap["adid"]:
-			for k, v := range m {
-				SaveToMemc(k, v, memcConnections["adid"], &options, &errorItems, &processedItems)
-			}
-		case m := <-deviceMap["dvid"]:
-			for k, v := range m {
-				SaveToMemc(k, v, memcConnections["dvid"], &options, &errorItems, &processedItems)
-			}
-		case <-cancelCh:
-			break LOOP
-		}
+	matches, err := filepath.Glob(options.pattern)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	errorRate := float64(errorItems) / float64(processedItems)
-	fmt.Printf("errorRate: %f \n", errorRate)
-	if errorRate < NormalErrorRate {
-		log.Printf("Acceptable error rate (%s). Successful load\n", errorRate)
-	} else {
-		log.Printf("High error rate (%f > %f). Failed load", errorRate, NormalErrorRate)
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for _, p := range matches {
+			oldPath := path.Clean(p)
+			fmt.Println("Found file: ", oldPath)
+			ReadGzFile(oldPath, rawLines)
+			//dirpath, fpath := path.Split(oldPath)
+			//newPath := path.Join(dirpath, "."+fpath)
+			//err := os.Rename(oldPath, newPath)
+			//if err != nil {
+			//	log.Println("Can not rename file: ", err)
+			//} else {
+			//	fmt.Printf("Renamed file: %s\n", newPath)
+			//}
+		}
+		close(rawLines)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for rawLine := range rawLines {
+			ParseRawLine(rawLine, preparedApps)
+		}
+		close(preparedApps)
+	}()
+
+	wg.Add(1)
+	go func(processedItems *uint64) {
+		defer wg.Done()
+		for pa := range preparedApps {
+			atomic.AddUint64(processedItems, 1)
+			fmt.Printf("%s chan key: %s value: %x\n", pa.deviceType, pa.key, pa.value)
+		}
+	}(&processedItems)
+
+	wg.Wait()
 	log.Printf("Processed lines: %d", processedItems)
+
+	//	errorRate := float64(errorItems) / float64(processedItems)
+	//	fmt.Printf("errorRate: %f \n", errorRate)
+	//	if errorRate < NormalErrorRate {
+	//		log.Printf("Acceptable error rate (%s). Successful load\n", errorRate)
+	//	} else {
+	//		log.Printf("High error rate (%f > %f). Failed load", errorRate, NormalErrorRate)
+	//	}
+	//	log.Printf("Processed lines: %d", processedItems)
 }
 
 func init() {
